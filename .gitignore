@@ -45,3 +45,4 @@ __pycache__/
 # logs
 logs/
 *.log
+.env
