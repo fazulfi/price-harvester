@@ -1,0 +1,75 @@
+import asyncio
+import os
+import tempfile
+import sqlite3
+import time
+import pytest
+from src.aggregator import OHLCVAggregator
+from config.config import config
+
+# Use a temp DB path override for tests
+@pytest.fixture
+def temp_db(monkeypatch):
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    monkeypatch.setattr(config, "DATABASE_PATH", path)
+    yield path
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+@pytest.mark.asyncio
+async def test_1s_aggregate(temp_db):
+    agg = OHLCVAggregator(db_path=temp_db, intervals=("1s",), flush_interval=0.2)
+    await agg.start()
+    base_ms = (int(time.time() * 1000) // 60000) * 60000 + 1000  # align to minute + 1s to avoid crossing minute boundary
+    symbol = "TEST"
+    # feed 3 ticks within same second
+    await agg.feed({"symbol": symbol, "ts": base_ms + 10, "price": 100.0, "qty": 1.0})
+    await agg.feed({"symbol": symbol, "ts": base_ms + 200, "price": 101.0, "qty": 2.0})
+    await agg.feed({"symbol": symbol, "ts": base_ms + 800, "price": 99.5, "qty": 0.5})
+    # wait for flush
+    await asyncio.sleep(0.5)
+    await agg.stop()
+    # check DB
+    conn = sqlite3.connect(temp_db)
+    cur = conn.cursor()
+    cur.execute("SELECT symbol, interval, ts, open, high, low, close, volume FROM aggregates")
+    rows = cur.fetchall()
+    conn.close()
+    assert len(rows) == 1
+    sym, iv, ts, open_, high, low, close, vol = rows[0]
+    assert sym == symbol
+    assert iv == "1s"
+    # open is first price, close is last price in that second
+    assert open_ == 100.0
+    assert high == 101.0
+    assert low == 99.5
+    assert close == 99.5
+    assert abs(vol - 3.5) < 1e-9
+
+@pytest.mark.asyncio
+async def test_1m_aggregate(temp_db):
+    agg = OHLCVAggregator(db_path=temp_db, intervals=("1m",), flush_interval=0.2)
+    await agg.start()
+    base_ms = (int(time.time() * 1000) // 60000) * 60000 + 1000  # align to minute + 1s to avoid crossing minute boundary
+    symbol = "ABC"
+    # feed ticks across different seconds but within same minute
+    await agg.feed({"symbol": symbol, "ts": base_ms + 10, "price": 10.0, "qty": 1.0})
+    await agg.feed({"symbol": symbol, "ts": base_ms + 15000, "price": 12.0, "qty": 2.0})
+    await agg.feed({"symbol": symbol, "ts": base_ms + 45000, "price": 9.0, "qty": 0.5})
+    await asyncio.sleep(0.6)
+    await agg.stop()
+    conn = sqlite3.connect(temp_db)
+    cur = conn.cursor()
+    cur.execute("SELECT symbol, interval, open, high, low, close, volume FROM aggregates WHERE symbol=?",(symbol,))
+    rows = cur.fetchall()
+    conn.close()
+    assert len(rows) == 1
+    sym, iv, open_, high, low, close, vol = rows[0]
+    assert open_ == 10.0
+    assert high == 12.0
+    assert low == 9.0
+    assert close == 9.0
+    assert abs(vol - 3.5) < 1e-9
