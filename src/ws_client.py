@@ -8,15 +8,14 @@ WS client using Reconnector for graceful reconnect + backoff.
 import asyncio
 import json
 import logging
-from src.logging_setup import setup_logging
-from src.metrics import increment as metrics_increment
-
 import signal
 from typing import List
 
 import aiohttp
 
 from config.config import config
+from src.logging_setup import setup_logging
+from src.metrics import increment as metrics_increment
 from src.utils import pretty
 from src.reconnect import Reconnector
 
@@ -54,47 +53,44 @@ async def single_session(endpoint: str, topics: List[str]):
                 if _shutdown:
                     LOG.info("single_session: shutdown flag set, exiting receive loop")
                     break
+
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     # metrics: one message received
                     try:
                         metrics_increment('messages_received')
                     except Exception:
-        try:
-            metrics_increment('errors')
-        except Exception:
-            pass
-
-                        pass
+                        # metrics error shouldn't stop the client
+                        LOG.debug("metrics_increment(messages_received) failed", exc_info=True)
 
                     try:
                         payload = json.loads(msg.data)
                     except Exception:
-        try:
-            metrics_increment('errors')
-        except Exception:
-            pass
-
+                        # count parsing errors
+                        try:
+                            metrics_increment('errors')
+                        except Exception:
+                            LOG.debug("metrics_increment(errors) failed", exc_info=True)
                         payload = msg.data
+
                     # default behavior: print payload (STEP 7 requirement)
                     print(pretty(payload))
+
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     LOG.debug("Binary message received (%d bytes)", len(msg.data))
+
                 elif msg.type == aiohttp.WSMsgType.CLOSE:
                     LOG.warning("Websocket closed by server: %s", msg)
                     break
+
                 elif msg.type == aiohttp.WSMsgType.ERROR:
+                    # log and increment error counter
                     try:
                         metrics_increment('errors')
                     except Exception:
-        try:
-            metrics_increment('errors')
-        except Exception:
-            pass
-
-                        pass
-
+                        LOG.debug("metrics_increment(errors) failed", exc_info=True)
                     LOG.error("Websocket error: %s", msg)
                     break
+
     LOG.info("single_session: connection context ended (clean exit)")
 
 async def run_with_reconnect(endpoint: str = DEFAULT_WS):
@@ -124,8 +120,7 @@ async def main():
         try:
             metrics_increment('errors')
         except Exception:
-            pass
-
+            LOG.debug("metrics_increment(errors) failed", exc_info=True)
         LOG.exception("main: unhandled exception")
     finally:
         LOG.info("main: exiting")
@@ -139,6 +134,5 @@ if __name__ == "__main__":
         try:
             metrics_increment('errors')
         except Exception:
-            pass
-
+            LOG.debug("metrics_increment(errors) failed", exc_info=True)
         LOG.exception("Unhandled exception in ws_client")
