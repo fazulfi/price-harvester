@@ -14,6 +14,7 @@ import time
 from typing import Dict, Any, List, Optional
 import aiosqlite
 from config.config import config
+from src.metrics import increment as metrics_increment
 
 INSERT_SQL = """
 INSERT INTO ticks (symbol, ts, price, qty, side, raw)
@@ -162,6 +163,10 @@ class AsyncStorage:
             try:
                 await db.executemany(INSERT_SQL, params)
                 await db.commit()
+                try:
+                    metrics_increment('messages_stored', len(params))
+                except Exception:
+                    pass
             except AttributeError:
                 # fallback if executemany not present for some reason: run many execute in a transaction
                 try:
