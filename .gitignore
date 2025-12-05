@@ -23,3 +23,25 @@ logs/
 # OS files
 .DS_Store
 Thumbs.db
+
+# virtualenv
+.venv/
+venv/
+env/
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# local DB
+*.db
+*.sqlite
+*.sqlite3
+
+# env files
+.env
+
+# logs
+logs/
+*.log
