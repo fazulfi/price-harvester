@@ -115,6 +115,7 @@ class AsyncStorage:
             except Exception as e:
                 print("storage final flush failed:", e)
 
+
     async def _flush_buffer(self, buffer: List[Dict[str, Any]]):
         """
         Convert buffer to params and insert using executemany inside transaction.
@@ -156,17 +157,22 @@ class AsyncStorage:
                 await db.execute("PRAGMA journal_mode = WAL;")
             except Exception:
                 pass
-            async with db.execute_many(INSERT_SQL, params) as _:
-                # Note: some aiosqlite versions don't support execute_many context manager
-                # So do executemany instead if needed:
-                pass
-            # Fallback to executemany (most compatible)
+
+            # Most compatible approach: use executemany
             try:
                 await db.executemany(INSERT_SQL, params)
                 await db.commit()
+            except AttributeError:
+                # fallback if executemany not present for some reason: run many execute in a transaction
+                try:
+                    await db.execute("BEGIN")
+                    for p in params:
+                        await db.execute(INSERT_SQL, p)
+                    await db.commit()
+                except Exception as e:
+                    print("storage: insert error in fallback path:", e)
             except Exception as e:
                 # If insertion fails, log and rethrow or drop
                 print("storage: insert error:", e)
-                # (optional) write failed batch to disk for later recovery
+                # optional: persist failed batch to disk for later recovery
                 # For now, we drop to avoid infinite retry loop
-
