@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=harvester
 Group=harvester
-WorkingDirectory=/home/price-harvester
+WorkingDirectory=/home/harvester/price-harvester
 # Use an EnvironmentFile to load secrets (not committed). Example path: /etc/default/price_harvester
 EnvironmentFile=/etc/default/price_harvester
 # Ensure python unbuffered so logs appear promptly
