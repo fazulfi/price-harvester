@@ -1,183 +1,279 @@
+# src/storage.py
 """
-Async SQLite writer with batching using aiosqlite.
+Async storage layer for price-harvester.
 
-Usage:
-    storage = AsyncStorage(batch_size=200, flush_interval=1.0)
-    await storage.start()
-    await storage.insert_tick(tick_dict)   # many times
-    await storage.stop()   # flushes and exits
+Features:
+- Uses aiosqlite for async writes
+- WAL mode enabled for better concurrency
+- Batching: accumulate ticks and flush as batch by size or interval
+- Graceful shutdown (flush on stop)
+- Simple enqueue_tick coroutine for producers (ws/parser)
+- run_storage_loop coroutine wrapper for main.py to run forever
 """
 
+from __future__ import annotations
 import asyncio
-import json
-import time
-from typing import Dict, Any, List, Optional
 import aiosqlite
-from config.config import config
-from src.metrics import increment as metrics_increment
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-INSERT_SQL = """
-INSERT INTO ticks (symbol, ts, price, qty, side, raw)
-VALUES (?, ?, ?, ?, ?, ?)
+# default config (can be overridden when creating AsyncStorage)
+DEFAULT_DB_PATH = os.environ.get("DATABASE_PATH", "./data/price.db")
+DEFAULT_BATCH_SIZE = 200
+DEFAULT_FLUSH_INTERVAL = 1.0  # seconds
+
+# SQL DDL
+_SCHEMA_SQL = """
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE IF NOT EXISTS ticks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL, -- timestamp in ms
+    price REAL NOT NULL,
+    qty REAL NOT NULL,
+    side TEXT,
+    raw TEXT,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticks_symbol_ts ON ticks(symbol, ts);
+CREATE TABLE IF NOT EXISTS aggregates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agg_symbol_interval_ts ON aggregates(symbol, interval, ts);
 """
 
 class AsyncStorage:
+    """
+    Async storage worker.
+
+    Usage:
+      st = AsyncStorage(db_path="./data/price.db")
+      await st.start()
+      await st.insert_tick({...})
+      await st.stop()
+    """
     def __init__(
         self,
-        db_path: Optional[str] = None,
-        batch_size: int = 500,
-        flush_interval: float = 1.0,
-        queue_maxsize: int = 10000,
-    ):
-        self.db_path = db_path or config.DATABASE_PATH
+        db_path: str = DEFAULT_DB_PATH,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        flush_interval: float = DEFAULT_FLUSH_INTERVAL,
+        max_queue: int = 10000,
+    ) -> None:
+        self.db_path = db_path
         self.batch_size = int(batch_size)
         self.flush_interval = float(flush_interval)
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue)
         self._worker_task: Optional[asyncio.Task] = None
-        self._stop_event = asyncio.Event()
         self._running = False
+        self._conn: Optional[aiosqlite.Connection] = None
 
-    async def start(self):
-        if self._worker_task is None:
-            self._running = True
-            self._worker_task = asyncio.create_task(self._worker())
-    
-    async def stop(self):
-        """Signal the worker to stop and wait for it to finish (flush remaining)."""
-        self._stop_event.set()
-        self._running = False
-        if self._worker_task:
-            await self._worker_task
-            self._worker_task = None
-        # reset stop for possible restart
-        self._stop_event.clear()
-
-    async def insert_tick(self, tick: Dict[str, Any], block: bool = True):
+    # --- public API for producers ---
+    async def insert_tick(self, tick: Dict[str, Any], block: bool = True) -> bool:
         """
-        Put a tick into the queue.
-        tick: dict with keys (symbol, ts, price, qty, side, raw)
-        block: if False, drop tick on full queue (to avoid backpressure)
+        Enqueue a single normalized tick.
+
+        If block is False and queue is full, returns False (dropped).
         """
         try:
             if block:
-                await self.queue.put(tick)
+                await self._queue.put(tick)
+                return True
             else:
-                self.queue.put_nowait(tick)
+                self._queue.put_nowait(tick)
+                return True
         except asyncio.QueueFull:
-            # optional policy: drop old / log
-            # For now: drop and continue
-            print("storage: queue full, dropping tick")
+            # drop tick
+            return False
 
-    async def _worker(self):
-        """
-        Background worker: gathers items into a buffer and writes in batches.
-        Uses WAL and executes many in a single transaction for speed.
-        """
-        buffer: List[Dict[str, Any]] = []
-        last_flush = time.time()
-        while self._running or not self.queue.empty() or buffer:
-            try:
-                # Wait for next item up to flush_interval
-                try:
-                    item = await asyncio.wait_for(self.queue.get(), timeout=self.flush_interval)
-                    buffer.append(item)
-                except asyncio.TimeoutError:
-                    # nothing new -> flush if buffer not empty
-                    pass
-
-                # Drain queue up to batch_size
-                while len(buffer) < self.batch_size:
-                    try:
-                        item = self.queue.get_nowait()
-                        buffer.append(item)
-                    except asyncio.QueueEmpty:
-                        break
-
-                now = time.time()
-                # Condition to flush: batch full or interval passed
-                if buffer and (len(buffer) >= self.batch_size or (now - last_flush) >= self.flush_interval):
-                    await self._flush_buffer(buffer)
-                    buffer.clear()
-                    last_flush = now
-
-                # check stop event loop condition
-                if self._stop_event.is_set() and self.queue.empty() and not buffer:
-                    break
-
-            except Exception as exc:
-                # Unexpected error in worker loop: log and continue
-                print("storage worker error:", exc)
-                await asyncio.sleep(1.0)
-
-        # Final flush (if any left)
-        if buffer:
-            try:
-                await self._flush_buffer(buffer)
-            except Exception as e:
-                print("storage final flush failed:", e)
-
-
-    async def _flush_buffer(self, buffer: List[Dict[str, Any]]):
-        """
-        Convert buffer to params and insert using executemany inside transaction.
-        """
-        if not buffer:
+    # --- lifecycle ---
+    async def start(self) -> None:
+        if self._running:
             return
-        params = []
-        for b in buffer:
-            # normalize fields and guard types
-            symbol = b.get("symbol")
-            ts = None
-            try:
-                ts_val = b.get("ts")
-                ts = int(ts_val) if ts_val is not None else None
-            except Exception:
-                ts = None
-            price = None
-            try:
-                price = float(b.get("price")) if b.get("price") is not None else None
-            except Exception:
-                price = None
-            qty = None
-            try:
-                qty = float(b.get("qty")) if b.get("qty") is not None else None
-            except Exception:
-                qty = None
-            side = b.get("side")
-            raw = b.get("raw")
-            try:
-                raw_json = json.dumps(raw, ensure_ascii=False)
-            except Exception:
-                raw_json = str(raw)
-            params.append((symbol, ts, price, qty, side, raw_json))
+        # ensure dir exists
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        # open connection and apply schema
+        self._conn = await aiosqlite.connect(self.db_path)
+        # enable WAL and pragmas
+        await self._conn.execute("PRAGMA journal_mode = WAL;")
+        await self._conn.execute("PRAGMA synchronous = NORMAL;")
+        # apply schema (create tables if not exists)
+        await self._conn.executescript(_SCHEMA_SQL)
+        await self._conn.commit()
+        # worker
+        self._running = True
+        self._worker_task = asyncio.create_task(self._worker_loop())
+        return
 
-        # actual DB write
-        async with aiosqlite.connect(self.db_path, timeout=30) as db:
-            # ensure WAL (redundant if init_db already set, but safe)
+    async def stop(self) -> None:
+        # stop worker task and flush remaining
+        if not self._running:
+            return
+        self._running = False
+        if self._worker_task:
+            self._worker_task.cancel()
             try:
-                await db.execute("PRAGMA journal_mode = WAL;")
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        # close connection
+        if self._conn:
+            try:
+                await self._conn.commit()
+                await self._conn.close()
             except Exception:
                 pass
+            self._conn = None
 
-            # Most compatible approach: use executemany
+    # --- internal worker ---
+    async def _worker_loop(self) -> None:
+        """
+        Consume queue and write in batches.
+        """
+        if not self._conn:
+            # safety
+            self._conn = await aiosqlite.connect(self.db_path)
+            await self._conn.execute("PRAGMA journal_mode = WAL;")
+            await self._conn.execute("PRAGMA synchronous = NORMAL;")
+            await self._conn.executescript(_SCHEMA_SQL)
+            await self._conn.commit()
+
+        batch: List[Dict[str, Any]] = []
+        last_flush = time.time()
+        try:
+            while True:
+                try:
+                    # Wait for first tick (with timeout to allow periodic flush)
+                    timeout = max(0.0, self.flush_interval - (time.time() - last_flush))
+                    item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+                    batch.append(item)
+                except asyncio.TimeoutError:
+                    item = None
+
+                # flush conditions: size or time
+                now = time.time()
+                if (len(batch) >= self.batch_size) or (now - last_flush >= self.flush_interval and len(batch) > 0):
+                    await self._write_batch(batch)
+                    batch = []
+                    last_flush = now
+
+                # if queue empty and not running, break
+                if not self._running and self._queue.empty():
+                    if batch:
+                        await self._write_batch(batch)
+                        batch = []
+                    break
+        except asyncio.CancelledError:
+            # flush on cancel
+            if batch:
+                await self._write_batch(batch)
+            raise
+        except Exception:
+            # log but keep running
+            import traceback
+            traceback.print_exc()
+            # attempt to continue loop
+            await asyncio.sleep(1.0)
+            return
+
+    async def _write_batch(self, batch: List[Dict[str, Any]]) -> None:
+        """
+        Insert a batch of ticks into the DB using executemany.
+        Each tick should have keys: symbol, ts (ms int), price (float), qty (float), side, raw (optional)
+        """
+        if not batch:
+            return
+
+        # defensively ensure connection open
+        if not self._conn:
+            self._conn = await aiosqlite.connect(self.db_path)
+            await self._conn.execute("PRAGMA journal_mode = WAL;")
+            await self._conn.execute("PRAGMA synchronous = NORMAL;")
+            await self._conn.executescript(_SCHEMA_SQL)
+
+        # prepare rows
+        rows: List[Tuple[Any, ...]] = []
+        for t in batch:
+            symbol = t.get("symbol") or t.get("s") or ""
+            ts = int(t.get("ts") or t.get("T") or 0)
+            price = float(t.get("price") or t.get("p") or 0.0)
+            qty = float(t.get("qty") or t.get("v") or 0.0)
+            side = t.get("side") or t.get("S") or ""
+            raw = t.get("raw")
+            # normalize to tuple for DB
+            rows.append((symbol, ts, price, qty, side, str(raw)))
+
+        try:
+            await self._conn.executemany(
+                "INSERT INTO ticks(symbol, ts, price, qty, side, raw) VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            await self._conn.commit()
+        except Exception:
+            # on failure, try single inserts (slower) to avoid losing data
             try:
-                await db.executemany(INSERT_SQL, params)
-                await db.commit()
-                try:
-                    metrics_increment('messages_stored', len(params))
-                except Exception:
-                    pass
-            except AttributeError:
-                # fallback if executemany not present for some reason: run many execute in a transaction
-                try:
-                    await db.execute("BEGIN")
-                    for p in params:
-                        await db.execute(INSERT_SQL, p)
-                    await db.commit()
-                except Exception as e:
-                    print("storage: insert error in fallback path:", e)
-            except Exception as e:
-                # If insertion fails, log and rethrow or drop
-                print("storage: insert error:", e)
-                # optional: persist failed batch to disk for later recovery
-                # For now, we drop to avoid infinite retry loop
+                for r in rows:
+                    await self._conn.execute(
+                        "INSERT INTO ticks(symbol, ts, price, qty, side, raw) VALUES (?, ?, ?, ?, ?, ?)",
+                        r,
+                    )
+                await self._conn.commit()
+            except Exception:
+                # last resort: drop batch but print error
+                import traceback
+                traceback.print_exc()
+
+# --- Convenience singleton + run loop wrapper for main.py and enqueue helper ---
+
+_storage_singleton: Optional[AsyncStorage] = None
+
+def get_storage_singleton() -> AsyncStorage:
+    global _storage_singleton
+    if _storage_singleton is None:
+        _storage_singleton = AsyncStorage()
+    return _storage_singleton
+
+async def enqueue_tick(tick: Dict[str, Any], block: bool = True) -> bool:
+    """
+    Coroutine to enqueue a tick into the global storage queue.
+
+    Producers call: await enqueue_tick(parsed_tick)
+    Returns True if queued, False if dropped (queue full and block=False).
+    """
+    st = get_storage_singleton()
+    return await st.insert_tick(tick, block=block)
+
+async def run_storage_loop(db_path: Optional[str] = None, batch_size: Optional[int] = None, flush_interval: Optional[float] = None) -> None:
+    """
+    Top-level awaitable expected by main.py: starts storage worker and runs until cancelled.
+    Use optional parameters to override defaults.
+    """
+    st = get_storage_singleton()
+    if db_path:
+        st.db_path = db_path
+    if batch_size:
+        st.batch_size = int(batch_size)
+    if flush_interval:
+        st.flush_interval = float(flush_interval)
+
+    await st.start()
+    try:
+        # just sleep forever; main will cancel this coroutine on shutdown
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        # graceful shutdown: stop storage (flushes remaining)
+        await st.stop()
+        raise
