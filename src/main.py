@@ -1,3 +1,4 @@
+# src/main.py  (REPLACE previous file)
 """
 src.main - CLI entrypoint for price-harvester
 
@@ -40,10 +41,28 @@ def apply_overrides(namespace):
         except Exception:
             pass
 
+async def run_storage(dry_run: bool = False):
+    """
+    Run the storage writer loop (awaits run_storage_loop).
+    Expects src.storage.run_storage_loop to be an async function that runs forever
+    (or until cancelled).
+    """
+    LOG.info("Starting storage (dry_run=%s)...", dry_run)
+    # lazy import
+    try:
+        from src.metrics import set_dry_run as _set_dry
+        if dry_run:
+            _set_dry(True)
+    except Exception:
+        pass
+
+    from src.storage import run_storage_loop
+    await run_storage_loop()
+
 async def run_ws(dry_run: bool = False):
     """
-    Run the websocket reconnection loop.
-    Note: storage/metrics must respect dry-run if provided by implementation.
+    Run the websocket reconnection loop and a storage task in parallel.
+    Storage runs as background task in same event loop so writes occur.
     """
     LOG.info("Starting WS (dry_run=%s)...", dry_run)
     # lazy import to avoid startup side-effects
@@ -56,7 +75,30 @@ async def run_ws(dry_run: bool = False):
     except Exception:
         pass
 
-    await run_with_reconnect()
+    loop = asyncio.get_running_loop()
+    storage_task = loop.create_task(run_storage(dry_run=dry_run))
+
+    try:
+        # run_with_reconnect is expected to run "forever" (or until cancelled)
+        await run_with_reconnect()
+    except asyncio.CancelledError:
+        LOG.info("run_ws: got CancelledError")
+        raise
+    except Exception:
+        LOG.exception("run_ws: unexpected exception in WS loop")
+        raise
+    finally:
+        # ensure storage task is cancelled when WS stops
+        if not storage_task.done():
+            LOG.info("run_ws: cancelling storage task")
+            storage_task.cancel()
+            try:
+                await asyncio.wait_for(storage_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                LOG.warning("run_ws: storage task did not exit after cancel")
+            except asyncio.CancelledError:
+                LOG.info("run_ws: storage task cancelled successfully")
+        LOG.info("run_ws: exiting")
 
 def run_api_blocking(port: int = 8000):
     """Run FastAPI/uvicorn in blocking mode (process will block)."""
@@ -66,8 +108,7 @@ def run_api_blocking(port: int = 8000):
 
 async def run_both(dry_run: bool = False, port: int = 8000):
     """
-    Run WS as asyncio task and uvicorn in background thread.
-    This is a simple approach for small deployments.
+    Run WS and storage as asyncio tasks and uvicorn in background thread.
     """
     import threading
     import uvicorn
@@ -81,18 +122,33 @@ async def run_both(dry_run: bool = False, port: int = 8000):
 
     loop = asyncio.get_running_loop()
     ws_task = loop.create_task(run_ws(dry_run=dry_run))
+    storage_task = loop.create_task(run_storage(dry_run=dry_run))
 
     def _uvicorn_run():
         uvicorn.run("src.api:app", host="0.0.0.0", port=port, log_level="info")
 
     thread = threading.Thread(target=_uvicorn_run, daemon=True)
     thread.start()
-    LOG.info("Started uvicorn in background thread; websocket task running in event loop.")
+    LOG.info("Started uvicorn in background thread; websocket and storage tasks running in event loop.")
 
     try:
-        await ws_task
+        # await both tasks — if one ends unexpectedly, cancel the other
+        done, pending = await asyncio.wait(
+            {ws_task, storage_task}, return_when=asyncio.FIRST_EXCEPTION
+        )
+        for t in done:
+            if t.exception():
+                LOG.error("task finished with exception, cancelling pending tasks")
+                for p in pending:
+                    p.cancel()
+                # re-raise to let outer handler know
+                raise t.exception()
     except asyncio.CancelledError:
-        LOG.info("ws task cancelled")
+        LOG.info("run_both: cancelled")
+        # cancel tasks
+        ws_task.cancel()
+        storage_task.cancel()
+        raise
     finally:
         LOG.info("run_both: exiting")
 
