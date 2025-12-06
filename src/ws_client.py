@@ -26,10 +26,12 @@ DEFAULT_WS = "wss://stream.bybit.com/v5/public/linear"
 # global flag for clean shutdown
 _shutdown = False
 
+
 def _on_signal(signum, frame):
     global _shutdown
     LOG.info("Signal %s received, shutting down...", signum)
     _shutdown = True
+
 
 async def subscribe(ws, topics: List[str]):
     if not topics:
@@ -37,6 +39,7 @@ async def subscribe(ws, topics: List[str]):
     msg = {"op": "subscribe", "args": topics}
     await ws.send_str(json.dumps(msg))
     LOG.info("Sent subscribe: %s", topics)
+
 
 async def single_session(endpoint: str, topics: List[str]):
     """
@@ -49,6 +52,7 @@ async def single_session(endpoint: str, topics: List[str]):
         async with session.ws_connect(endpoint) as ws:
             LOG.info("single_session: connected, subscribing...")
             await subscribe(ws, topics)
+
             # consume until ws closes or shutdown
             async for msg in ws:
                 if _shutdown:
@@ -73,20 +77,21 @@ async def single_session(endpoint: str, topics: List[str]):
                             LOG.debug("metrics_increment(errors) failed", exc_info=True)
                         payload = msg.data
 
-                    # default behavior: print payload (STEP 7 requirement)
+                    # default behavior: pretty-print payload (STEP 7 requirement)
                     print(pretty(payload))
-# update last tick if it's a trade tick
-try:
-    if isinstance(payload, dict) and 'topic' in payload:
-        if payload['topic'].startswith('publicTrade'):
-            for it in payload.get('data', []):
-                sym = it.get('s')
-                ts = it.get('T') or it.get('ts')
-                if sym and ts:
-                    update_last_tick(sym, int(ts))
-except Exception:
-    pass
 
+                    # update last tick if it's a trade tick
+                    try:
+                        if isinstance(payload, dict) and 'topic' in payload:
+                            if payload['topic'].startswith('publicTrade'):
+                                for it in payload.get('data', []):
+                                    sym = it.get('s')
+                                    ts = it.get('T') or it.get('ts')
+                                    if sym and ts:
+                                        update_last_tick(sym, int(ts))
+                    except Exception:
+                        # swallow errors so message loop continues
+                        LOG.debug("Error while updating last tick", exc_info=True)
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     LOG.debug("Binary message received (%d bytes)", len(msg.data))
@@ -106,12 +111,15 @@ except Exception:
 
     LOG.info("single_session: connection context ended (clean exit)")
 
+
 async def run_with_reconnect(endpoint: str = DEFAULT_WS):
     topics = [f"publicTrade.{s.upper()}" for s in getattr(config, "SYMBOLS", ["BTCUSDT"])]
     reconn = Reconnector(logger=LOG, base=1.0, cap=60.0, max_attempts=None)
-    # define factory that returns the coroutine for a single session
-    async def factory():
-        await single_session(endpoint, topics)
+
+    # factory must return a coroutine (do NOT await here)
+    def factory():
+        return single_session(endpoint, topics)
+
     await reconn.run(factory)
 
 
@@ -122,7 +130,8 @@ async def main():
     logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     loop = asyncio.get_running_loop()
-    # register signals for graceful shutdown
+
+    # register signals for graceful shutdown (may not be supported on Windows)
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: _on_signal(s, None))
@@ -141,6 +150,7 @@ async def main():
         LOG.exception("main: unhandled exception")
     finally:
         LOG.info("main: exiting")
+
 
 if __name__ == "__main__":
     try:

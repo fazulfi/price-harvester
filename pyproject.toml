@@ -1,0 +1,10 @@
+[project]
+name = "price-harvester"
+version = "0.1.0"
+description = "Price harvester for Bybit"
+authors = [{name="You"}]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+price-harvester = "src.main:main"

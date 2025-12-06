@@ -12,8 +12,7 @@ Normalized tick dict keys:
   "price": float or None
   "qty": float or None
   "side": str or None
-  "raw": original item (for tests)
-  "_raw": original item (backwards-compatible)
+  "_raw": original item
 """
 from typing import List, Dict, Any, Iterable, Union
 
@@ -70,8 +69,6 @@ def _normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "price": price_val if price_val is not None else None,
         "qty": qty_val if qty_val is not None else None,
         "side": side if side is not None else None,
-        # provide both 'raw' (expected by tests) and '_raw' (backwards compat)
-        "raw": item,
         "_raw": item,
     }
     return normalized
@@ -117,7 +114,8 @@ def parse_public_trade_item(item: Any) -> Dict[str, Any]:
     Parse a single trade item and return a normalized dict.
     If input is a dict-like trade item -> normalized dict.
     If input is a full message with 'data' -> returns normalized first item.
-    If input is not a dict (e.g. string) -> returns a dict with None values and raw set.
+    If input is not a dict (e.g. string) -> returns a dict with None values and _raw set.
+    This makes tests expecting a single-dict return compatible.
     """
     # if not dict, try to handle gracefully
     if not isinstance(item, dict):
@@ -128,15 +126,17 @@ def parse_public_trade_item(item: Any) -> Dict[str, Any]:
                 parsed = json.loads(item)
                 # if parsed is dict, fallthrough to normal handling
                 if isinstance(parsed, dict):
+                    # if parsed contains data list, return first normalized
                     data = _get(parsed, ("data", "items"))
                     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
                         return _normalize_item(data[0])
+                    # else if parsed looks like single item:
                     if any(k in parsed for k in ("T", "t", "s", "p", "v")):
                         return _normalize_item(parsed)
             except Exception:
                 pass
-        # fallback: return None-fields with raw and _raw identical
-        return {"symbol": None, "ts": None, "price": None, "qty": None, "side": None, "raw": item, "_raw": item}
+        # fallback: return None-fields with raw
+        return {"symbol": None, "ts": None, "price": None, "qty": None, "side": None, "_raw": item}
 
     # if the dict looks like a full message with data list
     data = _get(item, ("data", "items"))
