@@ -1,0 +1,25 @@
+[Unit]
+Description=Price Harvester (Bybit price collector)
+After=network.target
+
+[Service]
+Type=simple
+User=harvester
+Group=harvester
+WorkingDirectory=/home/price-harvester
+# Use an EnvironmentFile to load secrets (not committed). Example path: /etc/default/price_harvester
+EnvironmentFile=/etc/default/price_harvester
+# Ensure python unbuffered so logs appear promptly
+Environment=PYTHONUNBUFFERED=1
+# Full path to python inside virtualenv
+ExecStart=/home/harvester/price-harvester/.venv/bin/python -m src.main --mode both
+Restart=on-failure
+RestartSec=5
+# File descriptor limits
+LimitNOFILE=65536
+# Optional: restrict capabilities, sandbox further if needed
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
