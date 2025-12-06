@@ -16,6 +16,7 @@ import aiohttp
 from config.config import config
 from src.logging_setup import setup_logging
 from src.metrics import increment as metrics_increment
+from src.state import update_last_tick, set_start_time
 from src.utils import pretty
 from src.reconnect import Reconnector
 
@@ -74,6 +75,18 @@ async def single_session(endpoint: str, topics: List[str]):
 
                     # default behavior: print payload (STEP 7 requirement)
                     print(pretty(payload))
+# update last tick if it's a trade tick
+try:
+    if isinstance(payload, dict) and 'topic' in payload:
+        if payload['topic'].startswith('publicTrade'):
+            for it in payload.get('data', []):
+                sym = it.get('s')
+                ts = it.get('T') or it.get('ts')
+                if sym and ts:
+                    update_last_tick(sym, int(ts))
+except Exception:
+    pass
+
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     LOG.debug("Binary message received (%d bytes)", len(msg.data))
@@ -101,7 +114,11 @@ async def run_with_reconnect(endpoint: str = DEFAULT_WS):
         await single_session(endpoint, topics)
     await reconn.run(factory)
 
+
 async def main():
+    import time
+    set_start_time(int(time.time() * 1000))
+
     logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     loop = asyncio.get_running_loop()
