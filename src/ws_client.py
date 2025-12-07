@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-WS client using Reconnector for graceful reconnect + backoff.
-
-- single_session: one websocket connection lifecycle (connect, subscribe, receive until closed)
-- Reconnector.run will call single_session repeatedly with backoff on failures
+WebSocket client for Bybit with graceful reconnect (Reconnector),
+metrics, pretty printing, and last_tick updates.
 """
+
 import asyncio
 import json
 import logging
@@ -20,16 +19,17 @@ from src.state import update_last_tick, set_start_time
 from src.utils import pretty
 from src.reconnect import Reconnector
 
-LOG = setup_logging('ws_client')
+LOG = setup_logging("ws_client")
+
 DEFAULT_WS = "wss://stream.bybit.com/v5/public/linear"
 
-# global flag for clean shutdown
 _shutdown = False
 
 
 def _on_signal(signum, frame):
+    """Graceful exit for systemd / Ctrl+C."""
     global _shutdown
-    LOG.info("Signal %s received, shutting down...", signum)
+    LOG.info("Signal %s received — shutting down...", signum)
     _shutdown = True
 
 
@@ -38,85 +38,73 @@ async def subscribe(ws, topics: List[str]):
         return
     msg = {"op": "subscribe", "args": topics}
     await ws.send_str(json.dumps(msg))
-    LOG.info("Sent subscribe: %s", topics)
+    LOG.info("Subscribed: %s", topics)
 
 
 async def single_session(endpoint: str, topics: List[str]):
-    """
-    Run a single websocket session: open connection, subscribe, and consume messages.
-    Returns when connection closes (or raises on error).
-    """
-    LOG.info("single_session: connecting to %s", endpoint)
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
+    """One websocket connection session."""
+    LOG.info("Connecting to: %s", endpoint)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.ws_connect(endpoint) as ws:
-            LOG.info("single_session: connected, subscribing...")
+            LOG.info("Connected — sending subscribe...")
             await subscribe(ws, topics)
 
-            # consume until ws closes or shutdown
             async for msg in ws:
                 if _shutdown:
-                    LOG.info("single_session: shutdown flag set, exiting receive loop")
+                    LOG.info("Shutdown flag detected — closing session.")
                     break
 
+                # TEXT MESSAGE
                 if msg.type == aiohttp.WSMsgType.TEXT:
-                    # metrics: one message received
                     try:
-                        metrics_increment('messages_received')
+                        metrics_increment("messages_received")
                     except Exception:
-                        # metrics error shouldn't stop the client
-                        LOG.debug("metrics_increment(messages_received) failed", exc_info=True)
+                        LOG.debug("metrics_increment failed", exc_info=True)
 
                     try:
                         payload = json.loads(msg.data)
                     except Exception:
-                        # count parsing errors
-                        try:
-                            metrics_increment('errors')
-                        except Exception:
-                            LOG.debug("metrics_increment(errors) failed", exc_info=True)
+                        metrics_increment("errors")
                         payload = msg.data
 
-                    # default behavior: pretty-print payload (STEP 7 requirement)
+                    # pretty print message (Step 7 spec)
                     print(pretty(payload))
 
-                    # update last tick if it's a trade tick
+                    # update last_tick
                     try:
-                        if isinstance(payload, dict) and 'topic' in payload:
-                            if payload['topic'].startswith('publicTrade'):
-                                for it in payload.get('data', []):
-                                    sym = it.get('s')
-                                    ts = it.get('T') or it.get('ts')
-                                    if sym and ts:
-                                        update_last_tick(sym, int(ts))
+                        if isinstance(payload, dict) and payload.get("topic", "").startswith("publicTrade"):
+                            for t in payload.get("data", []):
+                                sym = t.get("s")
+                                ts = t.get("T") or t.get("ts")
+                                if sym and ts:
+                                    update_last_tick(sym, int(ts))
                     except Exception:
-                        # swallow errors so message loop continues
-                        LOG.debug("Error while updating last tick", exc_info=True)
+                        LOG.debug("Error updating last_tick", exc_info=True)
 
+                # BINARY
                 elif msg.type == aiohttp.WSMsgType.BINARY:
-                    LOG.debug("Binary message received (%d bytes)", len(msg.data))
+                    LOG.debug("Binary %d bytes", len(msg.data))
 
+                # CLOSED
                 elif msg.type == aiohttp.WSMsgType.CLOSE:
-                    LOG.warning("Websocket closed by server: %s", msg)
+                    LOG.warning("Websocket closed by server")
                     break
 
+                # ERROR
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    # log and increment error counter
-                    try:
-                        metrics_increment('errors')
-                    except Exception:
-                        LOG.debug("metrics_increment(errors) failed", exc_info=True)
+                    metrics_increment("errors")
                     LOG.error("Websocket error: %s", msg)
                     break
 
-    LOG.info("single_session: connection context ended (clean exit)")
+    LOG.info("Session ended (clean exit)")
 
 
 async def run_with_reconnect(endpoint: str = DEFAULT_WS):
     topics = [f"publicTrade.{s.upper()}" for s in getattr(config, "SYMBOLS", ["BTCUSDT"])]
     reconn = Reconnector(logger=LOG, base=1.0, cap=60.0, max_attempts=None)
 
-    # factory must return a coroutine (do NOT await here)
     def factory():
         return single_session(endpoint, topics)
 
@@ -125,13 +113,11 @@ async def run_with_reconnect(endpoint: str = DEFAULT_WS):
 
 async def main():
     import time
-    set_start_time(int(time.time() * 1000))
 
-    logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    set_start_time(int(time.time() * 1000))
     loop = asyncio.get_running_loop()
 
-    # register signals for graceful shutdown (may not be supported on Windows)
+    # signal handler (systemd-compatible)
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, lambda s=sig: _on_signal(s, None))
@@ -143,23 +129,17 @@ async def main():
     except asyncio.CancelledError:
         LOG.info("main: cancelled")
     except Exception:
-        try:
-            metrics_increment('errors')
-        except Exception:
-            LOG.debug("metrics_increment(errors) failed", exc_info=True)
-        LOG.exception("main: unhandled exception")
+        metrics_increment("errors")
+        LOG.exception("Unhandled exception in ws_client main()")
     finally:
-        LOG.info("main: exiting")
+        LOG.info("Shutting down ws_client")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        LOG.info("Keyboard interrupt - exiting")
+        LOG.info("Keyboard interrupt — exiting.")
     except Exception:
-        try:
-            metrics_increment('errors')
-        except Exception:
-            LOG.debug("metrics_increment(errors) failed", exc_info=True)
-        LOG.exception("Unhandled exception in ws_client")
+        metrics_increment("errors")
+        LOG.exception("Fatal error in ws_client")
