@@ -1,201 +1,205 @@
-# src/storage.py
 """
-Async-safe sqlite writer for price-harvester.
+Async SQLite writer for ticks.
 
-Provides:
- - enqueue_tick(tick) coroutine to push parsed ticks into the writer queue
- - run_storage_loop() coroutine to be started as a background task
+- Exposes set_tick_queue(queue) to accept an asyncio.Queue from main.
+- Exposes run_storage(dry_run=False) coroutine that consumes queue and
+  writes ticks to SQLite in batches using aiosqlite.
+- Uses WAL mode and simple retry on SQLITE_BUSY.
+- Also exposes enqueue_tick coroutine for compatibility.
 """
+
 import asyncio
-import aiosqlite
 import logging
+import math
 import time
-from typing import Dict, Any, List
+from typing import Any, Dict, Iterable, List, Optional
+
+try:
+    import aiosqlite
+except Exception:
+    aiosqlite = None  # main will handle if missing
 
 from config.config import config
-from src.logging_setup import setup_logging
-from src.metrics import increment as metrics_increment
 
-LOG = setup_logging("storage")
-
-DB_PATH = getattr(config, "DATABASE_PATH", "./data/price.db")
-BATCH_SIZE = getattr(config, "STORAGE_BATCH_SIZE", 200)
-FLUSH_INTERVAL = getattr(config, "STORAGE_FLUSH_INTERVAL_S", 1.0)
-
-_queue: asyncio.Queue | None = None
-_task: asyncio.Task | None = None
+log = logging.getLogger("price_harvester.storage")
 
 
-def get_queue() -> asyncio.Queue:
-    global _queue
-    if _queue is None:
-        _queue = asyncio.Queue()
-    return _queue
+# queue that will be set by main via set_tick_queue
+_tick_queue: Optional[asyncio.Queue] = None
+_stop_requested = False
+_db_conn: Optional["aiosqlite.Connection"] = None  # type: ignore[name-defined]
+
+
+def set_tick_queue(q: asyncio.Queue) -> None:
+    """Main will call this to give us the ticks queue (non-blocking put)."""
+    global _tick_queue
+    _tick_queue = q
+    log.info("storage: tick queue set")
 
 
 async def enqueue_tick(tick: Dict[str, Any]) -> None:
-    """
-    Put one parsed tick into the storage queue.
-    tick should be normalized dict with keys:
-      - symbol (str)
-      - ts (int milliseconds)
-      - price (float)
-      - qty (float)
-      - side (str) e.g. "Buy" / "Sell"
-      - raw (optional)
-    """
-    q = get_queue()
-    await q.put(tick)
-
-
-async def _apply_pragmas(conn: aiosqlite.Connection) -> None:
-    # WAL mode for better concurrency and performance on VPS
-    await conn.execute("PRAGMA journal_mode=WAL;")
-    await conn.execute("PRAGMA synchronous=NORMAL;")
-    await conn.commit()
-
-
-async def _insert_batch(conn: aiosqlite.Connection, rows: List[tuple]) -> None:
-    if not rows:
+    """Async enqueue helper if caller prefers coroutine interface."""
+    if _tick_queue is None:
+        log.debug("enqueue_tick called but no queue configured")
         return
-    await conn.executemany(
-        "INSERT INTO ticks(symbol, ts, price, qty, side) VALUES (?, ?, ?, ?, ?);",
-        rows,
-    )
+    await _tick_queue.put(tick)
+
+
+async def _ensure_db() -> "aiosqlite.Connection":
+    """Open DB and set pragmas."""
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+    if aiosqlite is None:
+        raise RuntimeError("aiosqlite is required for async storage")
+
+    conn = await aiosqlite.connect(config.DATABASE_PATH, timeout=5.0)
+    # performance pragmas
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA synchronous = NORMAL;")
+    await conn.execute("PRAGMA foreign_keys = ON;")
     await conn.commit()
-    metrics_increment("messages_stored", len(rows))
+    _db_conn = conn
+    return conn
 
 
-async def _drain_batch(q: asyncio.Queue, max_count: int, timeout: float) -> List[tuple]:
-    """
-    Collect up to max_count items from queue. Wait up to timeout for first extra item.
-    Returns list of prepared tuples for DB insertion.
-    """
-    rows: List[tuple] = []
+def _tick_to_row(tick: Dict[str, Any]):
+    """Map normalized tick dict to DB row tuple (symbol, ts, price, qty, side)."""
+    # expected keys in normalized tick:
+    # symbol (str), ts (int ms), price (float), qty (float), side (str)
+    sym = tick.get("symbol") or tick.get("s") or tick.get("symbol_id") or "UNKNOWN"
+    ts = tick.get("ts") or tick.get("T") or tick.get("time") or int(time.time() * 1000)
+    # ensure ints
     try:
-        # always wait for at least one item (blocking)
-        item = await q.get()
-    except asyncio.CancelledError:
-        raise
+        ts = int(ts)
     except Exception:
-        return rows
-
-    # convert first item
-    rows.append(
-        (
-            item.get("symbol"),
-            int(item.get("ts") or 0),
-            float(item.get("price") or 0.0),
-            float(item.get("qty") or 0.0),
-            item.get("side"),
-        )
-    )
-    # gather more without blocking too long
-    start = time.time()
-    while len(rows) < max_count:
         try:
-            # try to get quickly, with small timeout
-            timeout_left = max(0.0, timeout - (time.time() - start))
-            if timeout_left <= 0:
-                break
-            item = await asyncio.wait_for(q.get(), timeout=timeout_left)
-            rows.append(
-                (
-                    item.get("symbol"),
-                    int(item.get("ts") or 0),
-                    float(item.get("price") or 0.0),
-                    float(item.get("qty") or 0.0),
-                    item.get("side"),
-                )
-            )
-        except asyncio.TimeoutError:
-            break
-        except asyncio.CancelledError:
-            raise
+            ts = int(float(ts))
         except Exception:
-            LOG.exception("Error while draining queue; skipping item")
-            continue
-    return rows
+            ts = int(time.time() * 1000)
 
-
-async def run_storage_loop() -> None:
-    """
-    Long-running task saving ticks from queue into SQLite in batches.
-    Start this with: asyncio.create_task(run_storage_loop())
-    """
-    q = get_queue()
-    LOG.info("storage: starting loop, DB=%s", DB_PATH)
-    # make sure directory exists (main should ensure but be defensive)
-    import os
-
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    price = tick.get("price") or tick.get("p") or tick.get("price_str") or 0.0
+    qty = tick.get("qty") or tick.get("v") or tick.get("volume") or 0.0
+    side = tick.get("side") or tick.get("S") or "NA"
 
     try:
-        async with aiosqlite.connect(DB_PATH) as conn:
-            await _apply_pragmas(conn)
-            # ensure table exists (safe to run multiple times)
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ticks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    ts INTEGER NOT NULL,
-                    price REAL,
-                    qty REAL,
-                    side TEXT,
-                    inserted_at INTEGER DEFAULT (strftime('%s','now') * 1000)
-                );
-                """
-            )
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_ticks_symbol_ts ON ticks(symbol, ts);"
-            )
-            await conn.commit()
-
-            while True:
-                try:
-                    rows = await _drain_batch(q, BATCH_SIZE, FLUSH_INTERVAL)
-                    if rows:
-                        await _insert_batch(conn, rows)
-                    else:
-                        # nothing queued; small sleep so loop isn't hot
-                        await asyncio.sleep(0.1)
-                except asyncio.CancelledError:
-                    LOG.info("storage: cancelled - flushing remaining items")
-                    # flush remaining items before exit
-                    remaining = []
-                    while not q.empty():
-                        try:
-                            item = q.get_nowait()
-                            remaining.append(
-                                (
-                                    item.get("symbol"),
-                                    int(item.get("ts") or 0),
-                                    float(item.get("price") or 0.0),
-                                    float(item.get("qty") or 0.0),
-                                    item.get("side"),
-                                )
-                            )
-                        except Exception:
-                            break
-                    if remaining:
-                        await _insert_batch(conn, remaining)
-                    raise
-                except Exception:
-                    LOG.exception("storage: unexpected error, sleeping briefly")
-                    await asyncio.sleep(1.0)
-    except asyncio.CancelledError:
-        LOG.info("storage: task cancelled (outer)")
+        price = float(price)
     except Exception:
-        LOG.exception("storage: fatal error (exiting loop)")
+        try:
+            price = float(str(price).replace(",", ""))
+        except Exception:
+            price = 0.0
+    try:
+        qty = float(qty)
+    except Exception:
+        try:
+            qty = float(str(qty).replace(",", ""))
+        except Exception:
+            qty = 0.0
+
+    return (sym, ts, price, qty, side)
 
 
-def start_storage_task(loop: asyncio.AbstractEventLoop) -> asyncio.Task:
+async def run_storage(dry_run: bool = False, batch_size: int = 200, flush_interval: float = 0.5):
     """
-    Create and remember background storage task. Idempotent.
+    Consume ticks from the configured queue and write to SQLite in batches.
+
+    - dry_run=True will consume but not write to DB (useful for tests).
+    - flush_interval: maximum wait before flushing a partial batch.
     """
-    global _task
-    if _task and not _task.done():
-        return _task
-    _task = loop.create_task(run_storage_loop(), name="storage-writer")
-    return _task
+    global _stop_requested
+    if _tick_queue is None:
+        raise RuntimeError("storage: tick queue not configured (call set_tick_queue)")
+    log.info("storage: run_storage starting (dry_run=%s)", dry_run)
+
+    conn = None
+    if not dry_run:
+        conn = await _ensure_db()
+
+    batch: List = []
+    last_flush = time.time()
+    try:
+        while not _stop_requested:
+            try:
+                # gather up to batch_size items with timeout
+                item = await asyncio.wait_for(_tick_queue.get(), timeout=flush_interval)
+                batch.append(_tick_to_row(item))
+                # mark task done on queue
+                try:
+                    _tick_queue.task_done()
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                # flush on timeout if we have something
+                pass
+
+            # flush if batch is big or flush_interval passed
+            now = time.time()
+            if batch and (len(batch) >= batch_size or now - last_flush >= flush_interval):
+                if dry_run:
+                    log.debug("storage: dry_run flush %d rows", len(batch))
+                    batch.clear()
+                    last_flush = now
+                    continue
+                # try insert with basic retry on SQLITE_BUSY
+                inserted = False
+                attempt = 0
+                max_attempts = 3
+                while not inserted and attempt < max_attempts:
+                    try:
+                        placeholders = ",".join(["(?,?,?,?,?)"] * len(batch))
+                        sql = (
+                            "INSERT INTO ticks (symbol, ts, price, qty, side) VALUES "
+                            + ",".join(["(?,?,?,?,?)"] * len(batch))
+                        )
+                        # flatten batch rows
+                        params = []
+                        for r in batch:
+                            params.extend(r)
+                        async with conn.execute("BEGIN"):
+                            await conn.execute_many(
+                                "INSERT INTO ticks (symbol, ts, price, qty, side) VALUES (?,?,?,?,?)", batch
+                            )
+                            await conn.commit()
+                        inserted = True
+                        log.debug("storage: inserted %d rows", len(batch))
+                        batch.clear()
+                        last_flush = now
+                    except Exception as e:
+                        attempt += 1
+                        log.warning("storage: insert attempt %d failed: %s", attempt, e)
+                        await asyncio.sleep(0.1 * attempt)
+                if not inserted:
+                    log.error("storage: failed to insert batch after %d attempts; dropping batch", max_attempts)
+                    batch.clear()
+
+    except asyncio.CancelledError:
+        log.info("storage: cancelled")
+    except Exception:
+        log.exception("storage: unexpected error in run_storage")
+    finally:
+        # flush remaining batch if any
+        if batch and not dry_run and conn:
+            try:
+                async with conn.execute("BEGIN"):
+                    await conn.execute_many(
+                        "INSERT INTO ticks (symbol, ts, price, qty, side) VALUES (?,?,?,?,?)", batch
+                    )
+                    await conn.commit()
+                log.info("storage: flushed last %d rows", len(batch))
+            except Exception:
+                log.exception("storage: failed to flush final batch")
+        # close DB
+        if _db_conn:
+            try:
+                await _db_conn.close()
+            except Exception:
+                log.exception("storage: error closing DB")
+        log.info("storage: stopped")
+
+
+def stop():
+    """Request storage loop to stop (can be called from sync shutdown)."""
+    global _stop_requested
+    _stop_requested = True
+    log.info("storage: stop requested")
