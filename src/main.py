@@ -1,3 +1,4 @@
+# src/main.py
 """
 Main runner for price-harvester.
 

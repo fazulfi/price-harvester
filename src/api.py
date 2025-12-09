@@ -1,74 +1,172 @@
 # src/api.py
 import time
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List
 from fastapi import FastAPI, Response, status
+from fastapi import WebSocket, WebSocketDisconnect
 
 logger = logging.getLogger("price_harvester.api")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="price-harvester", version="0.1")
+app = FastAPI(title="price-harvester", version="1.0")
 
-# shared state (safe defaults) — main akan meng-overwrite ini jika ada
+# -----------------------------
+# SHARED STATE (diisi oleh main)
+# -----------------------------
 _shared_state: Dict[str, Any] = {
     "started_at": int(time.time() * 1000),
-    "metrics": {"messages_received": 0, "messages_stored": 0, "errors": 0},
-    "last_ticks": {},
-    # optional: other fields that main may set
+
+    # metrics diisi main: ws_client + storage writer
+    "metrics": {
+        "messages_received": 0,
+        "messages_stored": 0,
+        "errors": 0,
+    },
+
+    # tick terakhir per simbol
+    "last_ticks": {},      # {"BTCUSDT": 1765102723123}
+
+    # agregat OHLCV terbaru
+    "latest_ohlcv": {},    # {"BTCUSDT": {"1s": {...}, "1m": {...}, ...}}
+
+    # daftar WebSocket clients untuk dashboard realtime
+    "ws_clients": [],      # list[WebSocket]
 }
 
+
+# --------------------------
+# INTERNAL: ambil health state
+# --------------------------
 def get_state() -> Dict[str, Any]:
-    """Return a copy of state for API responses (avoid mutation)."""
-    # shallow copy is fine for our small schema
-    st = {
-        "status": "ok",
-        "uptime_ms": None,
-        "metrics": {"messages_received": 0, "messages_stored": 0, "errors": 0},
-        "last_ticks": {},
-    }
+    """Return health/report state for /health endpoint."""
     try:
         started_at = _shared_state.get("started_at")
+        uptime = None
         if started_at:
-            st["uptime_ms"] = int(time.time() * 1000) - int(started_at)
-        st["metrics"].update(_shared_state.get("metrics", {}))
-        st["last_ticks"] = dict(_shared_state.get("last_ticks", {}))
-    except Exception as e:
-        # Defensive: log and return minimal state
-        logger.exception("error while building health state: %s", e)
-    return st
+            uptime = int(time.time() * 1000) - int(started_at)
 
+        return {
+            "status": "ok",
+            "uptime_ms": uptime,
+            "metrics": dict(_shared_state.get("metrics", {})),
+            "last_ticks": dict(_shared_state.get("last_ticks", {})),
+            "latest_ohlcv": _shared_state.get("latest_ohlcv", {}),
+        }
+
+    except Exception as e:
+        logger.exception("error building /health state: %s", e)
+        return {
+            "status": "error",
+            "uptime_ms": None,
+            "metrics": {"messages_received": 0, "messages_stored": 0, "errors": 1},
+            "last_ticks": {},
+            "latest_ohlcv": {},
+        }
+
+
+# --------------------------
+# HEALTH CHECK
+# --------------------------
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    """
-    Health endpoint. Defensive: will not raise even if internal state is broken.
-    main() can call `update_shared_state` to push real metrics into API.
-    """
     try:
         return get_state()
     except Exception as exc:
-        # This should rarely run because get_state() is defensive, but keep extra safeguard
-        logger.exception("unhandled exception in /health: %s", exc)
+        logger.exception("unhandled /health failure: %s", exc)
         return Response(
-            content='{"status":"error","message":"internal error"}',
+            content='{"status":"error"}',
             media_type="application/json",
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
-# helper for other modules to update the health state
-def update_shared_state(metrics: Dict[str, Any] = None, last_ticks: Dict[str, int] = None, started_at: int = None):
-    global _shared_state
+
+# --------------------------
+# ENDPOINT: ticks terbaru
+# --------------------------
+@app.get("/latest_ticks")
+async def latest_ticks():
+    """Return dict of symbol → last timestamp."""
+    return dict(_shared_state.get("last_ticks", {}))
+
+
+# --------------------------
+# ENDPOINT: OHLCV chart data
+# --------------------------
+@app.get("/chart/{symbol}/{interval}")
+async def chart(symbol: str, interval: str):
+    """
+    Dashboard frontend memanggil ini untuk dapatkan data OHLCV terakhir.
+    interval: '1s', '1m', '5m', '1h'
+    """
+    latest = _shared_state.get("latest_ohlcv", {})
+    sym = latest.get(symbol.upper(), {})
+
+    if interval not in sym:
+        return {"symbol": symbol, "interval": interval, "data": []}
+
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "data": sym[interval],  # list of bars
+    }
+
+
+# ---------------------------------------------------
+# WEBSOCKET: kirim data live ke dashboard (opsional)
+# ---------------------------------------------------
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    _shared_state["ws_clients"].append(ws)
+    logger.info("Dashboard WebSocket connected")
+
+    try:
+        while True:
+            await ws.receive_text()  # ignore incoming messages
+    except WebSocketDisconnect:
+        logger.info("Dashboard WebSocket disconnected")
+    finally:
+        if ws in _shared_state["ws_clients"]:
+            _shared_state["ws_clients"].remove(ws)
+
+
+# ---------------------------------------------------
+# DIPANGGIL DARI main.py
+# ---------------------------------------------------
+def update_shared_state(
+    metrics: Dict[str, Any] = None,
+    last_ticks: Dict[str, int] = None,
+    started_at: int = None,
+    latest_ohlcv: Dict[str, Any] = None,
+):
+    """
+    Digunakan main.py untuk update metrik / last tick / OHLCV aggregator.
+    """
     try:
         if started_at is not None:
             _shared_state["started_at"] = started_at
+
         if metrics:
             _shared_state.setdefault("metrics", {}).update(metrics)
+
         if last_ticks:
             _shared_state.setdefault("last_ticks", {}).update(last_ticks)
-    except Exception:
-        logger.exception("failed to update shared state")
 
-# optional: expose a debug endpoint to peek at raw internal state (useful during dev)
-@app.get("/_debug/state")
-async def debug_state():
-    # only for local dev — remove or protect in production
-    return _shared_state
+        if latest_ohlcv:
+            _shared_state.setdefault("latest_ohlcv", {}).update(latest_ohlcv)
+
+    except Exception:
+        logger.exception("failed updating shared state")
+
+
+def broadcast_to_dashboards(payload: Dict[str, Any]):
+    """Main.py memanggil ini untuk broadcast realtime update ke dashboard."""
+    clients: List[WebSocket] = _shared_state.get("ws_clients", [])
+
+    for ws in clients[:]:
+        try:
+            import json
+            ws.send_text(json.dumps(payload))
+        except Exception:
+            logger.warning("Dropping dead WebSocket client")
+            clients.remove(ws)

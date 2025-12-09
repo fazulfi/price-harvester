@@ -1,0 +1,135 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Price Harvester — Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Chart.js via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body{font-family:Inter,system-ui,Arial;margin:12px;color:#eee;background:#0b1220}
+    .row{display:flex;gap:12px;align-items:flex-start}
+    .card{background:#0f1724;padding:12px;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.5)}
+    h1{margin:0 0 8px 0;font-size:20px}
+    .big{font-size:28px;font-weight:700}
+    canvas{background:#071021;border-radius:6px}
+    table{border-collapse:collapse;width:100%;font-size:13px}
+    td,th{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.03)}
+  </style>
+</head>
+<body>
+  <h1>Price Harvester — Realtime Dashboard</h1>
+  <div class="row">
+    <div class="card" style="flex:1;min-width:360px">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div>Messages received</div>
+          <div id="recv" class="big">0</div>
+        </div>
+        <div>
+          <div>Messages stored</div>
+          <div id="stored" class="big">0</div>
+        </div>
+      </div>
+      <canvas id="chart" height="140"></canvas>
+    </div>
+
+    <div class="card" style="width:360px">
+      <div>Current price</div>
+      <div id="price" class="big">—</div>
+      <hr style="margin:8px 0;border:0;border-top:1px solid rgba(255,255,255,.04)">
+      <div>Latest ticks</div>
+      <table id="ticks">
+        <thead><tr><th>ts</th><th>sym</th><th>price</th><th>qty</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+const wsUrl = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/dashboard';
+const ws = new WebSocket(wsUrl);
+
+let messages_received = 0;
+let messages_stored = 0;
+let priceEl = document.getElementById('price');
+let recvEl = document.getElementById('recv');
+let storedEl = document.getElementById('stored');
+let ticksBody = document.querySelector('#ticks tbody');
+
+const dataWindow = 60;
+const labels = Array.from({length:dataWindow}).map((_,i)=>i-dataWindow+1);
+const chartData = { labels: labels.slice(), datasets: [
+  { label: 'received', data: Array(dataWindow).fill(0), borderColor: '#4ade80', tension:0.3 },
+  { label: 'stored', data: Array(dataWindow).fill(0), borderColor: '#60a5fa', tension:0.3 }
+]};
+
+const ctx = document.getElementById('chart').getContext('2d');
+const c = new Chart(ctx, {
+  type: 'line',
+  data: chartData,
+  options: {
+    animation:false,
+    plugins:{legend:{labels:{color:'#cbd5e1'}}},
+    scales:{x:{display:false}, y:{ticks:{color:'#94a3b8'}}}
+  }
+});
+
+function pushPoint(received, stored){
+  chartData.datasets[0].data.push(received);
+  chartData.datasets[0].data.shift();
+  chartData.datasets[1].data.push(stored);
+  chartData.datasets[1].data.shift();
+  c.update('none');
+}
+
+function addTickRow(t){
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td>${new Date(t.ts).toLocaleTimeString()}</td><td>${t.symbol||''}</td><td>${t.price}</td><td>${t.qty||''}</td>`;
+  const body = ticksBody;
+  body.insertBefore(tr, body.firstChild);
+  while(body.children.length>20) body.removeChild(body.lastChild);
+}
+
+ws.onopen = () => console.log('WS connected');
+ws.onclose = ()=> console.log('WS closed');
+let lastSecond = Math.floor(Date.now()/1000);
+let secRecv=0, secStored=0;
+ws.onmessage = (ev) => {
+  try{
+    const m = JSON.parse(ev.data);
+    if(m.type === 'tick'){
+      // tick event
+      priceEl.textContent = m.price;
+      addTickRow(m);
+      secRecv++;
+    } else if(m.type === 'metrics'){
+      messages_received = m.messages_received ?? messages_received;
+      messages_stored = m.messages_stored ?? messages_stored;
+      recvEl.textContent = messages_received;
+      storedEl.textContent = messages_stored;
+      secStored = 0; // not used here; metrics come from server
+    } else if(m.type === 'counter'){
+      // periodic counter tick
+      messages_received = m.messages_received;
+      messages_stored = m.messages_stored;
+      recvEl.textContent = messages_received;
+      storedEl.textContent = messages_stored;
+    }
+  }catch(e){console.warn(e)}
+};
+
+setInterval(()=>{
+  const nowSec = Math.floor(Date.now()/1000);
+  if(nowSec !== lastSecond){
+    // shift the rolling chart by pushing last second counts (we don't track per-second accurately here,
+    // frontend will receive counter events from server if you want precise)
+    pushPoint(0,0);
+    lastSecond = nowSec;
+  } else {
+    // keep updating chart occasionally
+  }
+}, 1000);
+</script>
+</body>
+</html>
