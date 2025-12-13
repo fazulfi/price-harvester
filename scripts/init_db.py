@@ -3,9 +3,6 @@
 Init SQLite DB for price-harvester.
 Creates tables: ticks, aggregates, sets pragmas (WAL) for better concurrency.
 """
-import os, sys
-# tambahkan root project ke sys.path (relatif terhadap lokasi scripts/)
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import sqlite3
 from pathlib import Path
 from config.config import config
