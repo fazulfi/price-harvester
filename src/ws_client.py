@@ -8,6 +8,9 @@ WS client using Reconnector for graceful reconnect + backoff.
 import asyncio
 import json
 import logging
+from src.logging_setup import setup_logging
+from src.metrics import increment as metrics_increment
+
 import signal
 from typing import List
 
@@ -17,7 +20,7 @@ from config.config import config
 from src.utils import pretty
 from src.reconnect import Reconnector
 
-LOG = logging.getLogger("ws_client")
+LOG = setup_logging('ws_client')
 DEFAULT_WS = "wss://stream.bybit.com/v5/public/linear"
 
 # global flag for clean shutdown
@@ -52,9 +55,25 @@ async def single_session(endpoint: str, topics: List[str]):
                     LOG.info("single_session: shutdown flag set, exiting receive loop")
                     break
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    # metrics: one message received
+                    try:
+                        metrics_increment('messages_received')
+                    except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+                        pass
+
                     try:
                         payload = json.loads(msg.data)
                     except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
                         payload = msg.data
                     # default behavior: print payload (STEP 7 requirement)
                     print(pretty(payload))
@@ -64,6 +83,16 @@ async def single_session(endpoint: str, topics: List[str]):
                     LOG.warning("Websocket closed by server: %s", msg)
                     break
                 elif msg.type == aiohttp.WSMsgType.ERROR:
+                    try:
+                        metrics_increment('errors')
+                    except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+                        pass
+
                     LOG.error("Websocket error: %s", msg)
                     break
     LOG.info("single_session: connection context ended (clean exit)")
@@ -92,6 +121,11 @@ async def main():
     except asyncio.CancelledError:
         LOG.info("main: cancelled")
     except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
         LOG.exception("main: unhandled exception")
     finally:
         LOG.info("main: exiting")
@@ -102,4 +136,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         LOG.info("Keyboard interrupt - exiting")
     except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
         LOG.exception("Unhandled exception in ws_client")
