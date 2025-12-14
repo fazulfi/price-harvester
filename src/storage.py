@@ -102,6 +102,10 @@ class AsyncStorage:
             async with aiosqlite.connect(self.db_path, timeout=30) as db:
                 await db.executemany(INSERT_SQL, params)
                 await db.commit()
+                try:
+                    metrics_increment('messages_stored', len(params))
+                except Exception:
+                    pass
         except Exception as e:
             print("storage insert error:", e)
             # drop batch to avoid infinite retry
