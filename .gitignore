@@ -69,3 +69,5 @@ __pycache__/
 # logs
 logs/
 *.log
+logs/
+logs/
