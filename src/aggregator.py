@@ -1,135 +1,191 @@
 import asyncio
-import sqlite3
 import time
-import contextlib
+import aiosqlite
+from typing import Dict, Any, Tuple
 from collections import defaultdict
-from typing import Dict, List, Iterable
+from config.config import config
 
+CREATE_AGG_TABLE = """
+CREATE TABLE IF NOT EXISTS aggregates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL,
+    created_at INTEGER DEFAULT (strftime('%s','now') * 1000),
+    UNIQUE(symbol, interval, ts)
+);
+"""
+
+class OHLCBucket:
+    def __init__(self):
+        self.open = None
+        self.high = None
+        self.low = None
+        self.close = None
+        self.volume = 0.0
+
+    def add(self, price: float, qty: float):
+        if self.open is None:
+            self.open = price
+            self.high = price
+            self.low = price
+            self.close = price
+            self.volume = float(qty or 0.0)
+        else:
+            self.close = price
+            if price > self.high:
+                self.high = price
+            if price < self.low:
+                self.low = price
+            self.volume += float(qty or 0.0)
+
+    def to_tuple(self, symbol: str, interval: str, ts: int) -> Tuple:
+        return (symbol, interval, ts, self.open, self.high, self.low, self.close, self.volume)
 
 class OHLCVAggregator:
-    def __init__(
-        self,
-        db_path: str,
-        intervals: Iterable[str] = ("1s",),
-        flush_interval: float = 1.0,
-    ):
-        self.db_path = db_path
-        self.intervals = tuple(intervals)
-        self.flush_interval = flush_interval
+    """
+    Async OHLCV aggregator that creates aggregates for configured intervals.
+    Idempotent-flush protection added to avoid duplicate writes for same (symbol,interval,ts).
+    """
+    INTERVAL_MS = {
+        "1s": 1000,
+        "1m": 60 * 1000,
+    }
 
-        self._buckets: Dict[str, Dict[int, Dict]] = defaultdict(dict)
-        self._lock = asyncio.Lock()
-        self._task: asyncio.Task | None = None
-        self._running = False
+    def __init__(self, db_path: str = None, intervals=("1s","1m"), flush_interval: float = 1.0):
+        self.db_path = db_path or config.DATABASE_PATH
+        self.intervals = list(intervals)
+        self.flush_interval = float(flush_interval)
+        # buckets: interval -> (symbol, bucket_ts) -> OHLCBucket
+        self.buckets: Dict[str, Dict[tuple, OHLCBucket]] = {iv: {} for iv in self.intervals}
+        # keep track of which (symbol, ts) we've already flushed to DB to avoid double-write
+        self._flushed_ts: Dict[str, set] = {iv: set() for iv in self.intervals}
+        self._task = None
+        self._stop = asyncio.Event()
 
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS aggregates (
-                symbol TEXT,
-                interval TEXT,
-                ts INTEGER,
-                open REAL,
-                high REAL,
-                low REAL,
-                close REAL,
-                volume REAL,
-                PRIMARY KEY (symbol, interval, ts)
-            )
-            """
-        )
-        self._conn.commit()
-
-    # ======================
-    # lifecycle
-    # ======================
     async def start(self):
-        self._running = True
-        self._task = asyncio.create_task(self._loop())
+        # ensure table exists
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executescript(CREATE_AGG_TABLE)
+            await db.commit()
+        if self._task is None:
+            self._task = asyncio.create_task(self._worker())
 
     async def stop(self):
-        self._running = False
+        self._stop.set()
         if self._task:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-        await self.flush()
-        self._conn.close()
+            await self._task
+            self._task = None
 
-    async def _loop(self):
-        while self._running:
-            await asyncio.sleep(self.flush_interval)
-            await self.flush()
+    def _align_ts(self, ts_ms: int, interval_ms: int) -> int:
+        return (ts_ms // interval_ms) * interval_ms
 
-    # ======================
-    # public API (TEST USES THIS)
-    # ======================
-    async def feed(self, tick: Dict):
+    async def feed(self, tick: Dict[str, Any]):
         """
-        tick:
-        {
-          symbol, ts(ms), price, qty
-        }
+        Accept one tick. Non-blocking addition to in-memory bucket.
         """
-        symbol = tick["symbol"]
-        ts_ms = int(tick["ts"])
-        price = float(tick["price"])
-        qty = float(tick.get("qty", 0.0))
-
-        async with self._lock:
-            for interval in self.intervals:
-                sec = self._interval_seconds(interval)
-                bucket_ts = (ts_ms // 1000 // sec) * sec * 1000
-
-                b = self._buckets[interval].get(bucket_ts)
-                if not b:
-                    self._buckets[interval][bucket_ts] = {
-                        "symbol": symbol,
-                        "interval": interval,
-                        "ts": bucket_ts,
-                        "open": price,
-                        "high": price,
-                        "low": price,
-                        "close": price,
-                        "volume": qty,
-                    }
-                else:
-                    b["high"] = max(b["high"], price)
-                    b["low"] = min(b["low"], price)
-                    b["close"] = price
-                    b["volume"] += qty
-
-    async def flush(self):
-        async with self._lock:
-            rows = []
-            for interval, data in self._buckets.items():
-                rows.extend(data.values())
-            self._buckets.clear()
-
-        if not rows:
+        try:
+            symbol = tick.get("symbol")
+            ts = tick.get("ts")
+            price = tick.get("price")
+            qty = tick.get("qty") or 0.0
+            if symbol is None or ts is None or price is None:
+                return
+            ts = int(ts)
+            price = float(price)
+            qty = float(qty)
+        except Exception:
+            # malformed tick, ignore silently
             return
 
-        sql = """
-        INSERT INTO aggregates
-        (symbol, interval, ts, open, high, low, close, volume)
-        VALUES
-        (:symbol, :interval, :ts, :open, :high, :low, :close, :volume)
-        ON CONFLICT(symbol, interval, ts)
-        DO UPDATE SET
-            high=MAX(high, excluded.high),
-            low=MIN(low, excluded.low),
-            close=excluded.close,
-            volume=aggregates.volume + excluded.volume
+        for iv in self.intervals:
+            interval_ms = self.INTERVAL_MS.get(iv)
+            if not interval_ms:
+                continue
+            bucket_ts = self._align_ts(ts, interval_ms)
+            key = (symbol, bucket_ts)
+            bmap = self.buckets[iv]
+            if key not in bmap:
+                bmap[key] = OHLCBucket()
+            bmap[key].add(price, qty)
+
+    async def _flush_interval(self, iv: str, cutoff_ts: int):
         """
+        Flush buckets for interval iv where bucket_ts < cutoff_ts.
+        Returns list of tuples ready to insert to DB.
+        """
+        interval_ms = self.INTERVAL_MS[iv]
+        to_write = []
+        bmap = self.buckets[iv]
+        keys = list(bmap.keys())
+        for (symbol, bucket_ts) in keys:
+            if bucket_ts < cutoff_ts:
+                # idempotency check: only flush if not already flushed
+                if (symbol, bucket_ts) in self._flushed_ts[iv]:
+                    # already flushed earlier, remove from map to free memory
+                    bmap.pop((symbol, bucket_ts), None)
+                    continue
+                bucket = bmap.pop((symbol, bucket_ts))
+                to_write.append(bucket.to_tuple(symbol, iv, bucket_ts))
+                # mark as flushed so future flush/stop won't duplicate
+                self._flushed_ts[iv].add((symbol, bucket_ts))
+        return to_write
 
-        self._conn.executemany(sql, rows)
-        self._conn.commit()
+    async def _worker(self):
+        """
+        Periodic worker: every flush_interval seconds flush finished buckets to DB.
+        A bucket is considered finished when its bucket_ts < current aligned time.
+        """
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(self.flush_interval)
+                now_ms = int(time.time() * 1000)
+                all_to_write = []
+                for iv in self.intervals:
+                    interval_ms = self.INTERVAL_MS.get(iv)
+                    if not interval_ms:
+                        continue
+                    cutoff = (now_ms // interval_ms) * interval_ms
+                    rows = await self._flush_interval(iv, cutoff)
+                    all_to_write.extend(rows)
 
-    # ======================
-    def _interval_seconds(self, interval: str) -> int:
-        return {
-            "1s": 1,
-            "1m": 60,
-            "5m": 300,
-            "1h": 3600,
-        }[interval]
+                if all_to_write:
+                    async with aiosqlite.connect(self.db_path) as db:
+                        try:
+                            await db.executemany(
+                                "INSERT OR REPLACE INTO aggregates (symbol, interval, ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                all_to_write,
+                            )
+                            await db.commit()
+                        except Exception as e:
+                            # best-effort: ignore errors to avoid crashing worker
+                            print("aggregator: db write error:", e)
+            # On stop: flush everything remaining (but skip those already flushed)
+            all_to_write = []
+            for iv in self.intervals:
+                bmap = self.buckets[iv]
+                for (symbol, bucket_ts), bucket in list(bmap.items()):
+                    if (symbol, bucket_ts) in self._flushed_ts[iv]:
+                        # already flushed earlier
+                        bmap.pop((symbol, bucket_ts), None)
+                        continue
+                    all_to_write.append(bucket.to_tuple(symbol, iv, bucket_ts))
+                    bmap.pop((symbol, bucket_ts), None)
+                    self._flushed_ts[iv].add((symbol, bucket_ts))
+            if all_to_write:
+                async with aiosqlite.connect(self.db_path) as db:
+                    try:
+                        await db.executemany(
+                            "INSERT OR REPLACE INTO aggregates (symbol, interval, ts, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            all_to_write,
+                        )
+                        await db.commit()
+                    except Exception as e:
+                        print("aggregator final write error:", e)
+        except asyncio.CancelledError:
+            pass
