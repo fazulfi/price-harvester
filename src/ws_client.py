@@ -11,6 +11,9 @@ import logging
 from src.logging_setup import setup_logging
 from src.metrics import increment as metrics_increment
 
+from src.logging_setup import setup_logging
+from src.metrics import increment as metrics_increment
+
 import signal
 from typing import List
 
@@ -66,12 +69,43 @@ async def single_session(endpoint: str, topics: List[str]):
 
                         pass
 
+                    # metrics: one message received
+                    try:
+                        metrics_increment('messages_received')
+                    except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+        try:
+            metrics_increment('errors')
+        except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+            pass
+
+                        pass
+
                     try:
                         payload = json.loads(msg.data)
                     except Exception:
         try:
             metrics_increment('errors')
         except Exception:
+            pass
+
+        try:
+            metrics_increment('errors')
+        except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
             pass
 
                         payload = msg.data
@@ -89,6 +123,26 @@ async def single_session(endpoint: str, topics: List[str]):
         try:
             metrics_increment('errors')
         except Exception:
+            pass
+
+                        pass
+
+                    try:
+                        metrics_increment('errors')
+                    except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+        try:
+            metrics_increment('errors')
+        except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
             pass
 
                         pass
@@ -126,6 +180,16 @@ async def main():
         except Exception:
             pass
 
+        try:
+            metrics_increment('errors')
+        except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
+            pass
+
         LOG.exception("main: unhandled exception")
     finally:
         LOG.info("main: exiting")
@@ -139,6 +203,16 @@ if __name__ == "__main__":
         try:
             metrics_increment('errors')
         except Exception:
+            pass
+
+        try:
+            metrics_increment('errors')
+        except Exception:
+        try:
+            metrics_increment('errors')
+        except Exception:
+            pass
+
             pass
 
         LOG.exception("Unhandled exception in ws_client")
