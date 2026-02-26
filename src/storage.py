@@ -1,9 +1,12 @@
 import asyncio
 import json
 import time
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 import aiosqlite
+
+from config.config import config
+from src.metrics import increment as metrics_increment
 
 
 CREATE_TABLE_SQL = """
@@ -25,10 +28,17 @@ VALUES (?, ?, ?, ?, ?, ?);
 
 
 class AsyncStorage:
-    def __init__(self, db_path: str = "./data/price.db", batch_size: int = 100, flush_interval: float = 1.0):
+    def __init__(
+        self,
+        db_path: str = "./data/price.db",
+        batch_size: int = 100,
+        flush_interval: float = 1.0,
+        retention_ms: int | None = None,
+    ):
         self.db_path = db_path
         self.batch_size = batch_size
         self.flush_interval = flush_interval
+        self.retention_ms = retention_ms if retention_ms is not None else int(config.DATA_RETENTION_HOURS * 3600 * 1000)
 
         self._queue: List[Dict[str, Any]] = []
         self._lock = asyncio.Lock()
@@ -56,13 +66,11 @@ class AsyncStorage:
             except asyncio.CancelledError:
                 pass
 
-        # final flush
         await self._flush()
 
     async def insert_tick(self, tick: Dict[str, Any]):
         async with self._lock:
             self._queue.append(tick)
-
             if len(self._queue) >= self.batch_size:
                 await self._flush_locked()
 
@@ -79,33 +87,38 @@ class AsyncStorage:
             await self._flush_locked()
 
     async def _flush_locked(self):
-        if not self._queue:
-            return
-
         batch = self._queue
         self._queue = []
 
-        params = []
-        for t in batch:
-            params.append(
-                (
-                    t.get("symbol"),
-                    t.get("ts"),
-                    t.get("price"),
-                    t.get("qty"),
-                    t.get("side"),
-                    json.dumps(t.get("raw")) if t.get("raw") is not None else None,
-                )
+        params = [
+            (
+                t.get("symbol"),
+                t.get("ts"),
+                t.get("price"),
+                t.get("qty"),
+                t.get("side"),
+                json.dumps(t.get("raw")) if t.get("raw") is not None else None,
             )
+            for t in batch
+        ]
 
         try:
             async with aiosqlite.connect(self.db_path, timeout=30) as db:
-                await db.executemany(INSERT_SQL, params)
+                if params:
+                    await db.executemany(INSERT_SQL, params)
+                    try:
+                        metrics_increment("messages_stored", len(params))
+                    except Exception:
+                        pass
+
+                await self._cleanup_old_ticks(db)
                 await db.commit()
-                try:
-                    metrics_increment('messages_stored', len(params))
-                except Exception:
-                    pass
         except Exception as e:
             print("storage insert error:", e)
-            # drop batch to avoid infinite retry
+
+    async def _cleanup_old_ticks(self, db: aiosqlite.Connection):
+        if not self.retention_ms or self.retention_ms <= 0:
+            return
+
+        cutoff_ms = int(time.time() * 1000) - int(self.retention_ms)
+        await db.execute("DELETE FROM ticks WHERE ts IS NOT NULL AND ts < ?", (cutoff_ms,))

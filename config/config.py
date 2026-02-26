@@ -7,7 +7,7 @@ load_dotenv()
 
 
 def _parse_symbols() -> list[str]:
-    raw = os.getenv("SYMBOLS", "BTCUSDT")
+    raw = os.getenv("SYMBOLS", "ALL_USDT")
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
@@ -25,6 +25,7 @@ class Config:
     SYMBOLS: list[str] = field(default_factory=_parse_symbols)
 
     HARVEST_INTERVAL: int = int(os.getenv("HARVEST_INTERVAL", "5"))
+    DATA_RETENTION_HOURS: int = int(os.getenv("DATA_RETENTION_HOURS", "1"))
 
 
 # single shared config instance

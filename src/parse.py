@@ -43,6 +43,14 @@ def parse_public_trade_item(item: Dict[str, Any]) -> Dict[str, Any]:
         # Return safe fallback with raw stored
         return {"symbol": None, "ts": None, "price": None, "qty": None, "side": None, "raw": item}
 
+    # Some call sites pass the full websocket message payload.
+    # In this case, parse the first trade item from `data`.
+    data = item.get("data")
+    if isinstance(data, list) and data:
+        first_item = data[0]
+        if isinstance(first_item, dict):
+            item = first_item
+
     # timestamp: common keys (T, t, ts)
     ts = None
     for k in ("T", "t", "ts"):
